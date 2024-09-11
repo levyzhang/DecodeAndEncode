@@ -1,7 +1,8 @@
 import rospy
 import message_filters
-from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs.msg import Image, CompressedImage, PointCloud2
 from nav_msgs.msg import Odometry
+from nmea_msgs.msg import Gpgga
 import numpy as np
 import cv2
 import os
@@ -14,64 +15,100 @@ import struct
 
 
 class DataCollector:
-    def __init__(self, image_topic, pointcloud_topic, odometry_topic, save_dir, time_tolerance=0.1):
+    def __init__(self, image_topic, thermal_image_topic, pointcloud_topic, odometry_topic, save_dir, time_tolerance=0.1):
         self.current_frame = 0
         self.save_dir = save_dir
         self.time_tolerance = time_tolerance
         self.odometry_position = None
         self.odometry_orientation = None
         self.pointcloud_frames = []
+        self.thermal_image_queue = deque()
+        self.image_queue = deque()
+        self.odometry_queue = deque()
+        self.global_2d_pointcloud = []  # Global 2D point cloud
+        self.init_lat_lon_h = None
+        self.pcd_timsetamp = None
 
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
 
-        self.image_queue = deque()
-        self.odometry_queue = deque()
-
-        image_sub = message_filters.Subscriber(image_topic, Image)
+        # Subscribe to topics
+        image_sub = message_filters.Subscriber(image_topic, CompressedImage)
+        thermal_image_sub = message_filters.Subscriber(thermal_image_topic, Image)
         pointcloud_sub = message_filters.Subscriber(pointcloud_topic, PointCloud2)
         odometry_sub = rospy.Subscriber(odometry_topic, Odometry, self.odometry_callback)
+        gpgga_sub = rospy.Subscriber("/beidou_gpgga", Gpgga, self.gpgga_callback)
 
-        self.ts = message_filters.ApproximateTimeSynchronizer([image_sub, pointcloud_sub], 10, time_tolerance)
+        # Time synchronizer for approximate time-based synchronization
+        self.ts = message_filters.ApproximateTimeSynchronizer([image_sub, thermal_image_sub, pointcloud_sub], 10, time_tolerance)
         self.ts.registerCallback(self.queue_data)
 
     def odometry_callback(self, odometry_data):
+        # Store odometry data in a queue
         self.odometry_queue.append(odometry_data)
 
-    def queue_data(self, image_data, pointcloud_data):
+    def gpgga_callback(self, msg):
+        # Extract GPS data from GPGGA message
+        latitude = msg.lat
+        longitude = msg.lon
+        altitude = msg.alt
+
+        # Store initial GPS coordinates
+        if not self.init_lat_lon_h:
+            self.init_lat_lon_h = (latitude, longitude, altitude)
+            rospy.loginfo("Initial latitude: {:.6f}".format(latitude))
+            rospy.loginfo("Initial longitude: {:.6f}".format(longitude))
+            rospy.loginfo("Initial altitude: {:.2f} meters".format(altitude))
+
+    def queue_data(self, image_data, thermal_image_data, pointcloud_data):
+        # Store synchronized data into queues
         self.image_queue.append(image_data)
+        self.thermal_image_queue.append(thermal_image_data)
         self.pointcloud_frames.append(pointcloud_data)
 
+        # Process and save data when enough frames are collected
         if len(self.pointcloud_frames) == 10:
             self.process_and_save()
 
     def find_closest_odometry(self, timestamp):
+        # Find the closest odometry data based on timestamp
         if not self.odometry_queue:
             return None
 
-        # Make a copy of the deque to prevent mutation during iteration
         odometry_copy = list(self.odometry_queue)
-
         closest_odometry = min(odometry_copy, key=lambda odom: abs(odom.header.stamp - timestamp))
         return closest_odometry
 
     def find_closest_image(self, timestamp):
+        # Find the closest image based on timestamp
         if not self.image_queue:
             return None
 
         closest_image = min(self.image_queue, key=lambda img: abs(img.header.stamp - timestamp))
         return closest_image
 
+    def find_closest_thermal_image(self, timestamp):
+        # Find the closest thermal image based on timestamp
+        if not self.thermal_image_queue:
+            return None
+
+        closest_thermal_image = min(self.thermal_image_queue, key=lambda img: abs(img.header.stamp - timestamp))
+        return closest_thermal_image
+
     def transform_point(self, point, transform_matrix):
+        # Apply transformation to a 3D point
         homogenous_point = np.array([point[0], point[1], point[2], 1.0])
         transformed_point = np.dot(transform_matrix, homogenous_point)
         return transformed_point[:3], point[3]
 
     def process_and_save(self):
+        # Process all collected data and save to file
         final_pointcloud = []
         last_pointcloud = self.pointcloud_frames[-1]
         timestamp = last_pointcloud.header.stamp
+        self.pcd_timsetamp = timestamp
 
+        # Transform points based on odometry data
         for pcl in self.pointcloud_frames:
             closest_odometry = self.find_closest_odometry(pcl.header.stamp)
             if closest_odometry:
@@ -81,17 +118,24 @@ class DataCollector:
                     final_pointcloud.append(
                         (transformed_point[0], transformed_point[1], transformed_point[2], intensity))
 
+        # Find closest images and odometry
         closest_image = self.find_closest_image(timestamp)
+        closest_thermal_image = self.find_closest_thermal_image(timestamp)
         closest_odometry = self.find_closest_odometry(timestamp)
 
-        self.process_frame(closest_image, final_pointcloud, closest_odometry)
+        # Process the data for the current frame
+        self.process_frame(closest_image, closest_thermal_image, final_pointcloud, closest_odometry)
 
+        # Reset queues for the next frame
         self.pointcloud_frames = []
         self.image_queue = deque(filter(lambda img: img.header.stamp >= timestamp, self.image_queue))
+        self.thermal_image_queue = deque(filter(lambda img: img.header.stamp >= timestamp, self.thermal_image_queue))
         self.odometry_queue = deque(filter(lambda odom: odom.header.stamp >= timestamp, self.odometry_queue))
 
-    def process_frame(self, image_data, fused_pointcloud, odometry_data):
+    def process_frame(self, image_data, thermal_image_data, fused_pointcloud, odometry_data):
+        # Process the image, thermal image, point cloud, and odometry data
         self.process_image(image_data)
+        self.process_thermal_image(thermal_image_data)
         self.process_pointcloud(fused_pointcloud)
         if odometry_data:
             self.process_odometry(odometry_data)
@@ -103,23 +147,34 @@ class DataCollector:
 
     def process_image(self, data):
         try:
+            # Process the image (JPEG format)
+            self.image_data = data.data
+        except Exception as e:
+            rospy.logerr("Failed to process image: {}".format(e))
+
+    def process_thermal_image(self, data):
+        try:
+            # Process the thermal image, resize and encode as JPEG
             height = data.height
             width = data.width
             image_data = np.frombuffer(data.data, dtype=np.uint8).reshape((height, width, -1))
             resized_image = cv2.resize(image_data, (640, 480))
             _, jpg_data = cv2.imencode('.jpg', resized_image)
-            self.image_data = jpg_data.tobytes()
+            self.thermal_image_data = jpg_data.tobytes()
         except Exception as e:
-            rospy.logerr("Failed to process image: {}".format(e))
+            rospy.logerr("Failed to process thermal image: {}".format(e))
 
     def process_pointcloud(self, points):
-        self.pointcloud_3d_data = self.convert_points_to_binary(points)
+        # Convert and aggregate 2D point cloud
         points_2d = self.convert_to_2d(points)
         points_2d_sampled = self.sample_points(points_2d)
-        self.pointcloud_2d_data = self.convert_points_to_binary(points_2d_sampled)
-        self.generate_json(points, points_2d_sampled)
+        self.global_2d_pointcloud = self.aggregate_pointclouds(self.global_2d_pointcloud, points_2d_sampled)
+        self.pointcloud_2d_data = self.convert_points_to_binary(self.global_2d_pointcloud)
+        self.pointcloud_3d_data = self.convert_points_to_binary(points)
+        self.generate_json(points, self.global_2d_pointcloud)
 
     def process_odometry(self, data):
+        # Store odometry position and orientation
         self.odometry_position = [data.pose.pose.position.x,
                                   data.pose.pose.position.y,
                                   data.pose.pose.position.z]
@@ -129,6 +184,7 @@ class DataCollector:
                                      data.pose.pose.orientation.w]
 
     def get_transform_matrix(self, odometry_data):
+        # Get the transformation matrix from odometry data
         position = [odometry_data.pose.pose.position.x, odometry_data.pose.pose.position.y,
                     odometry_data.pose.pose.position.z]
         orientation = [odometry_data.pose.pose.orientation.x, odometry_data.pose.pose.orientation.y,
@@ -140,6 +196,7 @@ class DataCollector:
         return transform_matrix
 
     def quaternion_to_rotation_matrix(self, quaternion):
+        # Convert quaternion to rotation matrix
         x, y, z, w = quaternion
         return np.array([
             [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
@@ -148,15 +205,18 @@ class DataCollector:
         ])
 
     def convert_points_to_binary(self, points):
+        # Convert point cloud to binary format
         binary_data = bytearray()
         for point in points:
             binary_data.extend(struct.pack('ffff', float(point[0]), float(point[1]), float(point[2]), float(point[3])))
         return binary_data
 
     def convert_to_2d(self, points):
+        # Convert 3D points to 2D
         return [(x, y, 0.0, intensity) for x, y, _, intensity in points]
 
     def sample_points(self, points, distance_threshold=0.05):
+        # Sample points using a grid-based method to avoid redundancy
         grid = defaultdict(list)
         grid_size = distance_threshold
         for point in points:
@@ -165,17 +225,44 @@ class DataCollector:
         return [self.average_points(cell_points) for cell_points in grid.values()]
 
     def average_points(self, points):
+        # Calculate the average of points in a grid cell
         avg_x = sum(point[0] for point in points) / len(points)
         avg_y = sum(point[1] for point in points) / len(points)
         avg_intensity = sum(point[3] for point in points) / len(points)
         return avg_x, avg_y, 0.0, avg_intensity
 
+    def aggregate_pointclouds(self, global_points, new_points, distance_threshold=0.05):
+        # Aggregate new 2D point cloud data into the global point cloud
+        grid = defaultdict(list)
+        grid_size = distance_threshold
+
+        # Insert global points into the grid
+        for point in global_points:
+            grid_key = (int(point[0] // grid_size), int(point[1] // grid_size))
+            grid[grid_key].append(point)
+
+        # Merge new points into the global point cloud
+        for point in new_points:
+            grid_key = (int(point[0] // grid_size), int(point[1] // grid_size))
+            if grid[grid_key]:
+                grid[grid_key].append(point)
+            else:
+                grid[grid_key].append(point)
+
+        # Return the aggregated points
+        return [self.average_points(cell_points) for cell_points in grid.values()]
+
     def quaternion_to_yaw(self, quat):
+        # Extract yaw angle from quaternion
         _, _, z, w = quat
         return math.atan2(2.0 * (w * z), 1.0 - 2.0 * (z * z))
 
     def generate_json(self, points_3d, points_2d):
-        timestamp = rospy.Time.now().to_sec()
+        # Generate a JSON structure for metadata
+        timestamp = self.pcd_timsetamp.to_sec()
+        floor = 0
+        if timestamp > 1723467254.351712227:
+            floor = -1
         if self.odometry_position and self.odometry_orientation:
             yaw = self.quaternion_to_yaw(self.odometry_orientation)
             pos_yaw = self.odometry_position + [round(yaw, 6)]
@@ -185,21 +272,24 @@ class DataCollector:
         self.json_data = OrderedDict([
             ("device_id", 100002),
             ("device_time", timestamp),
+            ("init_lat_lon_h", [self.init_lat_lon_h[0], self.init_lat_lon_h[1], self.init_lat_lon_h[2]]),
             ("pos_yaw", pos_yaw),
-            ("floor", 7),
+            ("floor", floor),
             ("is_exit", random.random() < 0.1),
             ("fire_point", self.get_fire_point()),
-            ("3dpcd_num", len(points_3d)),
-            ("2dpcd_num", len(points_2d))
+            ("pcd_num_3d", len(points_3d)),
+            ("pcd_num_2d", len(points_2d))
         ])
 
     def get_fire_point(self):
+        # Randomly determine the fire point for simulation purposes
         if self.odometry_position:
             return self.odometry_position if random.random() < 0.1 else None
         return None
 
     def save_bin_file(self):
-        if self.image_data and self.pointcloud_3d_data and self.pointcloud_2d_data and self.json_data:
+        # Save all data to a binary file, using the global 2D point cloud
+        if self.image_data and self.thermal_image_data and self.pointcloud_3d_data and self.global_2d_pointcloud and self.json_data:
             bin_filename = os.path.join(self.save_dir, "frame_{}.bin".format(self.current_frame + 1))
             with open(bin_filename, 'wb') as bin_file:
                 # Encode JSON data
@@ -210,31 +300,43 @@ class DataCollector:
                 # Encode 3D point cloud data
                 bin_file.write(self.pointcloud_3d_data)
 
-                # Encode 2D point cloud data
-                bin_file.write(self.pointcloud_2d_data)
+                # Encode global 2D point cloud data
+                global_2d_binary = self.convert_points_to_binary(self.global_2d_pointcloud)
+                bin_file.write(global_2d_binary)
 
                 # Encode JPEG image data
                 bin_file.write(struct.pack('I', len(self.image_data)))
                 bin_file.write(self.image_data)
 
+                # Encode JPEG thermal image data
+                bin_file.write(struct.pack('I', len(self.thermal_image_data)))
+                bin_file.write(self.thermal_image_data)
+
             rospy.loginfo("Saved BIN file: {}".format(bin_filename))
 
         # Reset data for the next frame
         self.image_data = None
+        self.thermal_image_data = None
         self.pointcloud_3d_data = None
-        self.pointcloud_2d_data = None
-        self.json_data = None
+        # Keep global 2D point cloud for future frames
+        self.global_2d_pointcloud = self.global_2d_pointcloud
+        self.json_data = None 
 
 
 if __name__ == '__main__':
-    image_topic = '/iray/thermal_img'
-    pointcloud_topic = '/livox/lidar'
+    # Define topics and parameters
+    image_topic = '/camera/color/image_raw/compressed'
+    thermal_image_topic = '/iray/thermal_img_show'
+    pointcloud_topic = '/cloud_registered_body'
     odometry_topic = '/Odometry'  # Odometry topic
     save_dir = './BIN'
     time_tolerance = 0.1  # Maximum allowed time difference between synchronized messages
 
+    # Initialize ROS node
     rospy.init_node('data_collector', anonymous=True)
 
-    data_collector = DataCollector(image_topic, pointcloud_topic, odometry_topic, save_dir, time_tolerance)
+    # Create DataCollector object
+    data_collector = DataCollector(image_topic, thermal_image_topic, pointcloud_topic, odometry_topic, save_dir, time_tolerance)
 
+    # Keep the node running
     rospy.spin()
